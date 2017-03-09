@@ -56,6 +56,13 @@ public class SwiftyStoreKit {
     private var receiptRefreshRequest: InAppReceiptRefreshRequest?
     #endif
     // MARK: Enums
+    // Purchased or restored product
+    public struct Product {
+        public let productId: String
+        public let transaction: SKPaymentTransaction
+        public let needsFinishTransaction: Bool
+    }
+
     public struct RetrieveResults {
         public let retrievedProducts: Set<SKProduct>
         public let invalidProductIDs: Set<String>
@@ -69,20 +76,16 @@ public class SwiftyStoreKit {
         case PaymentNotAllowed
     }
     public enum PurchaseResult {
-        case Success(productId: String)
+        case Success(product: Product)
         case Error(error: PurchaseError)
     }
     public struct RestoreResults {
-        public let restoredProductIds: [String]
+        public let restoredProducts: [Product]
         public let restoreFailedProducts: [(ErrorType, String?)]
     }
     public enum RefreshReceiptResult {
-        case Success
+        case Success(receiptData: NSData)
         case Error(error: ErrorType)
-    }
-    public struct CompletedTransaction {
-        public let productId: String
-        public let transactionState: PaymentTransactionState
     }
 
     public enum InternalErrorCode: Int {
@@ -101,8 +104,8 @@ public class SwiftyStoreKit {
         return sharedInstance.inflightPurchases.count > 0 || sharedInstance.restoreRequest != nil
     }
     
-    public class func completeTransactions(completion: (completedTransactions: [CompletedTransaction]) -> ()) {
-        sharedInstance.completeTransactionsObserver = InAppCompleteTransactionsObserver(callback: completion)
+    public class func completeTransactions(atomically atomically: Bool, completion: (completedTransactions: [Product]) -> ()) {
+        sharedInstance.completeTransactionsObserver = InAppCompleteTransactionsObserver(atomically: atomically, callback: completion)
     }
     
     // MARK: Public methods
@@ -122,15 +125,15 @@ public class SwiftyStoreKit {
      *  - Parameter applicationUsername: an opaque identifier for the user’s account on your system
      *  - Parameter completion: handler for result
      */
-    public class func purchaseProduct(productId: String, applicationUsername: String = "", completion: (result: PurchaseResult) -> ()) {
+    public class func purchaseProduct(productId: String, atomically: Bool, applicationUsername: String = "", completion: (result: PurchaseResult) -> ()) {
         
         if let product = sharedInstance.store.products[productId] {
-            sharedInstance.purchase(product: product, applicationUsername: applicationUsername, completion: completion)
+            sharedInstance.purchase(product: product, atomically: atomically, applicationUsername: applicationUsername, completion: completion)
         }
         else {
             retrieveProductsInfo(Set([productId])) { result -> () in
                 if let product = result.retrievedProducts.first {
-                    sharedInstance.purchase(product: product, applicationUsername: applicationUsername, completion: completion)
+                    sharedInstance.purchase(product: product, atomically: atomically, applicationUsername: applicationUsername, completion: completion)
                 }
                 else if let error = result.error {
                     completion(result: .Error(error: .Failed(error: error)))
@@ -142,15 +145,25 @@ public class SwiftyStoreKit {
         }
     }
     
-    public class func restorePurchases(completion: (results: RestoreResults) -> ()) {
+    public class func restorePurchases(atomically: Bool = true, completion: (results: RestoreResults) -> ()) {
 
-        sharedInstance.restoreRequest = InAppProductPurchaseRequest.restorePurchases() { results in
+        sharedInstance.restoreRequest = InAppProductPurchaseRequest.restorePurchases(atomically: atomically) { results in
         
             sharedInstance.restoreRequest = nil
             let results = sharedInstance.processRestoreResults(results)
             completion(results: results)
         }
     }
+
+    public class func finishTransaction(transaction transaction: SKPaymentTransaction) {
+        InAppProductPurchaseRequest.finishTransaction(transaction)
+    }
+    
+    
+    public static var localReceiptData: NSData? {
+        return InAppReceipt.appStoreReceiptData
+    }
+    
 
     /**
      *  Verify application receipt
@@ -209,10 +222,10 @@ public class SwiftyStoreKit {
 
             switch result {
             case .Success:
-                if InAppReceipt.data == nil {
-                    completion(result: .Error(error: ReceiptError.NoReceiptData))
+                if let appStoreReceiptData = InAppReceipt.appStoreReceiptData {
+                    completion(result: .Success(receiptData: appStoreReceiptData))
                 } else {
-                    completion(result: .Success)
+                    completion(result: .Error(error: ReceiptError.NoReceiptData))
                 }
             case .Error(let e):
                 completion(result: .Error(error: e))
@@ -227,7 +240,7 @@ public class SwiftyStoreKit {
     #endif
 
     // MARK: private methods
-    private func purchase(product product: SKProduct, applicationUsername: String = "", completion: (result: PurchaseResult) -> ()) {
+    private func purchase(product product: SKProduct, atomically: Bool, applicationUsername: String = "", completion: (result: PurchaseResult) -> ()) {
         guard SwiftyStoreKit.canMakePayments else {
             completion(result: .Error(error: .PaymentNotAllowed))
             return
@@ -237,7 +250,7 @@ public class SwiftyStoreKit {
             return
         }
 
-        inflightPurchases[productIdentifier] = InAppProductPurchaseRequest.startPayment(product, applicationUsername: applicationUsername) { results in
+        inflightPurchases[productIdentifier] = InAppProductPurchaseRequest.startPayment(product, atomically: atomically, applicationUsername: applicationUsername) { results in
 
             self.inflightPurchases[productIdentifier] = nil
             
@@ -250,8 +263,8 @@ public class SwiftyStoreKit {
 
     private func processPurchaseResult(result: InAppProductPurchaseRequest.TransactionResult) -> PurchaseResult {
         switch result {
-        case .Purchased(let productId):
-            return .Success(productId: productId)
+        case .Purchased(let product):
+            return .Success(product: product)
         case .Failed(let error):
             return .Error(error: .Failed(error: error))
         case .Restored(let productId):
@@ -260,19 +273,19 @@ public class SwiftyStoreKit {
     }
     
     private func processRestoreResults(results: [InAppProductPurchaseRequest.TransactionResult]) -> RestoreResults {
-        var restoredProductIds: [String] = []
+        var restoredProducts: [Product] = []
         var restoreFailedProducts: [(ErrorType, String?)] = []
         for result in results {
             switch result {
-            case .Purchased(let productId):
-                restoreFailedProducts.append((storeInternalError(code: InternalErrorCode.PurchasedWhenRestoringPurchase.rawValue, description: "Cannot purchase product \(productId) from restore purchases path"), productId))
+            case .Purchased(let product):
+                restoreFailedProducts.append((storeInternalError(code: InternalErrorCode.PurchasedWhenRestoringPurchase.rawValue, description: "Cannot purchase product \(product.productId) from restore purchases path"), product.productId))
             case .Failed(let error):
                 restoreFailedProducts.append((error, nil))
-            case .Restored(let productId):
-                restoredProductIds.append(productId)
+            case .Restored(let product):
+                restoredProducts.append(product)
             }
         }
-        return RestoreResults(restoredProductIds: restoredProductIds, restoreFailedProducts: restoreFailedProducts)
+        return RestoreResults(restoredProducts: restoredProducts, restoreFailedProducts: restoreFailedProducts)
     }
     
     private func requestProducts(productIds: Set<String>, completion: (result: RetrieveResults) -> ()) {
